@@ -2648,6 +2648,47 @@ namespace orc {
     }
   }
 
+  TEST(TimestampAliasCacheEviction, readerSurvivesAliasCacheEviction) {
+    MemoryOutputStream memStream(DEFAULT_MEM_STREAM_SIZE);
+    MemoryPool* pool = getDefaultPool();
+    std::unique_ptr<Type> type(Type::buildTypeFromString("struct<ts:timestamp>"));
+
+    // Write 2000 rows so that reading with a 1024-row batch requires two next() calls.
+    const uint64_t rowCount = 2000;
+    std::unique_ptr<Writer> writer =
+        createWriter(64 * 1024 * 1024, 64 * 1024, 64 * 1024, CompressionKind_ZLIB, *type, pool,
+                     &memStream, FileVersion::v_0_12(), 0, "America/New_York");
+    std::unique_ptr<ColumnVectorBatch> batch = writer->createRowBatch(rowCount);
+    StructVectorBatch* structBatch = dynamic_cast<StructVectorBatch*>(batch.get());
+    TimestampVectorBatch* tsBatch = dynamic_cast<TimestampVectorBatch*>(structBatch->fields[0]);
+    for (uint64_t i = 0; i < rowCount; ++i) {
+      tsBatch->data[i] = static_cast<int64_t>(i * 3600);
+      tsBatch->nanoseconds[i] = 0;
+    }
+    structBatch->numElements = rowCount;
+    tsBatch->numElements = rowCount;
+    writer->add(*batch);
+    writer->close();
+
+    auto inStream = std::make_unique<MemoryInputStream>(memStream.getData(), memStream.getLength());
+    std::unique_ptr<Reader> reader = createReader(pool, std::move(inStream));
+    std::unique_ptr<RowReader> rowReader = createRowReader(reader.get(), "GMT");
+    ASSERT_EQ(rowCount, reader->getNumberOfRows());
+
+    std::unique_ptr<ColumnVectorBatch> readBatch = rowReader->createRowBatch(1024);
+
+    // First next() opens the stripe, constructs TimestampColumnReader, and stores
+    // writerTimezone_ = &getTimezoneByName("America/New_York").
+    ASSERT_TRUE(rowReader->next(*readBatch));
+    ASSERT_EQ(1024u, readBatch->numElements);
+
+    // Populate aliases in the timezone cache
+    (void)getTimezoneByName("US/Eastern");
+
+    // Verify that writerTimezone_ is still a valid pointer
+    EXPECT_TRUE(rowReader->next(*readBatch));
+  }
+
   std::vector<TestParams> testParams = {{FileVersion::v_0_11(), true},
                                         {FileVersion::v_0_11(), false},
                                         {FileVersion::v_0_12(), false},
